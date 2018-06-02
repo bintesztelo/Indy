@@ -38,44 +38,81 @@ uses Classes, System.SysUtils, IdSSLOpenSSL, IdTCPClient, IdGlobal, IdCoderMIME,
 Type
   TSWSCDataEvent = procedure(Sender: TObject; const Text: string) of object;
   TSWSCErrorEvent = procedure(Sender: TObject; exception:Exception;const Text: string; var forceDisconnect) of object;
+//      *  %x0 denotes a continuation frame
+//      *  %x1 denotes a text frame
+//      *  %x2 denotes a binary frame
+//      *  %x3-7 are reserved for further non-control frames
+//      *  %x8 denotes a connection close
+//      *  %x9 denotes a ping
+//      *  %xA denotes a pong
+//      *  %xB-F are reserved for further control frames
 
+  TOpCode = (TOContinuation, TOTextFrame, TOBinaryFrame, TOConnectionClose, TOPing, TOPong);
+  Const
+  TOpCodeByte: array[TopCode] of Byte = ($0, $1, $2, $8, $9, $A);
+
+  Type
   TIdSimpleWebSocketClient = class(TIdTCPClient)
   private
-    ExpectedSec_WebSocket_Accept: string;
+    SecWebSocketAcceptExpectedResponse: string;
     FHeartBeatInterval: Cardinal;
     FAutoCreateHandler: Boolean;
     FURL: String;
-    function generateWebSocketKey():String;
+    FOnUpgrade: TnotifyEvent;
+    FonHeartBeatTimer: TNotifyEvent;
+    FonError: TSWSCErrorEvent;
+    FonPing: TSWSCDataEvent;
+    FonConnectionDataEvent: TSWSCDataEvent;
+    FonDataEvent: TSWSCDataEvent;
+    FUpgraded: Boolean;
+
   protected
+
     lInternalLock:TCriticalSection;
+    lClosingEventLocalHandshake:Boolean;
+    //Sync Event
+    lSyncFunctionEvent:TSimpleEvent;
+    lSyncFunctionTrigger:TFunc<String,Boolean>;
+    //Sync Event
+
     //get if a particular bit is 1
     function Get_a_Bit(const aValue: Cardinal; const Bit: Byte): Boolean;
     //set a particular bit as 1
     function Set_a_Bit(const aValue: Cardinal; const Bit: Byte): Cardinal;
+    //set a particular bit as 0
+    function Clear_a_Bit(const aValue: Cardinal; const Bit: Byte): Cardinal;
 
-    function readFromSocket:boolean;virtual;
-    function encodeFrame(pMsg:String; pPong:Boolean=false):TIdBytes;
-    function encodePong:TidBytes;
+    procedure readFromWebSocket;virtual;
+    function encodeFrame(pMsg:String; pOpCode:TOpCode=TOpCode.TOTextFrame):TIdBytes;
     function verifyHeader(pHeader:TStrings):boolean;
     procedure startHeartBeat;
+    procedure sendCloseHandshake;
+    function generateWebSocketKey:String;
+
+
 
   published
-  public
-    onDataEvent:TSWSCDataEvent;
-    onConnectionDataEvent:TSWSCDataEvent;
-    onPing:TNotifyEvent;
-    onError:TSWSCErrorEvent;
-    onHeartBeatTimer:TNotifyEvent;
-    function Connected: Boolean; overload;
-    procedure Close;
-    property URL: String read FURL write FURL;
+    property onDataEvent: TSWSCDataEvent read FonDataEvent write FonDataEvent;
+    property onConnectionDataEvent: TSWSCDataEvent read FonConnectionDataEvent write FonConnectionDataEvent;
+    property onPing: TSWSCDataEvent read FonPing write FonPing;
+    property onError: TSWSCErrorEvent read FonError write FonError;
+    property onHeartBeatTimer: TNotifyEvent read FonHeartBeatTimer write FonHeartBeatTimer;
+    property OnUpgrade: TnotifyEvent read FOnUpgrade write FOnUpgrade;
     property HeartBeatInterval: Cardinal read FHeartBeatInterval write FHeartBeatInterval;
     property AutoCreateHandler: Boolean read FAutoCreateHandler write FAutoCreateHandler;
-    procedure writeText(pMsg:String);
-    constructor Create(AOwner: TComponent);
-    destructor Destroy; override;
+    property URL: String read FURL write FURL;
+  public
 
     procedure Connect(pURL:String);overload;
+    procedure Close;
+    function Connected: Boolean; overload;
+    property Upgraded: Boolean read FUpgraded;
+
+    procedure writeText(pMsg:String);
+    procedure writeTextSync(pMsg:String;pTriggerFunction:TFunc<String,Boolean>);
+
+    constructor Create(AOwner: TComponent);
+    destructor Destroy; override;
 
 end;
 
@@ -83,12 +120,19 @@ implementation
 
 { TIdSimpleWebSocketClient }
 
+function TIdSimpleWebSocketClient.Clear_a_Bit(const aValue: Cardinal;
+  const Bit: Byte): Cardinal;
+begin
+  Result := aValue and not (1 shl Bit);
+end;
+
 procedure TIdSimpleWebSocketClient.Close;
 begin
   self.lInternalLock.Enter;
   try
     if self.Connected then
     begin
+      self.sendCloseHandshake;
       self.IOHandler.InputBuffer.Clear;
       self.IOHandler.CloseGracefully;
       self.Disconnect;
@@ -109,12 +153,11 @@ begin
     rand[i] := byte(random(255));
 
   result := TIdEncoderMIME.EncodeBytes(rand);  //generates a random Base64String
-  self.ExpectedSec_WebSocket_Accept := Result + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'; //fixed string, see: https://tools.ietf.org/html/rfc6455#section-1.3
+  self.SecWebSocketAcceptExpectedResponse := Result + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'; //fixed string, see: https://tools.ietf.org/html/rfc6455#section-1.3
 
   with TIdHashSHA1.Create do
   try
-
-    ExpectedSec_WebSocket_Accept := TIdEncoderMIME.EncodeBytes(HashString( self.ExpectedSec_WebSocket_Accept ));
+    SecWebSocketAcceptExpectedResponse := TIdEncoderMIME.EncodeBytes(HashString( self.SecWebSocketAcceptExpectedResponse ));
   finally
     Free;
   end;
@@ -134,6 +177,7 @@ var  URI      : TIdURI;
      lSecure  : Boolean;
 begin
   try
+    lClosingEventLocalHandshake := false;
     URI           := TIdURI.Create(pURL);
     self.URL      := pURL;
     self.Host     := URI.Host;
@@ -160,7 +204,7 @@ begin
       begin
         self.IOHandler := TIdSSLIOHandlerSocketOpenSSL.Create(self);
         (self.IOHandler as TIdSSLIOHandlerSocketOpenSSL).SSLOptions.Mode := TIdSSLMode.sslmClient;
-        //(self.IOHandler as TIdSSLIOHandlerSocketOpenSSL).SSLOptions.SSLVersions := [TIdSSLVersion.sslvTLSv1, TIdSSLVersion.sslvTLSv1_1, TIdSSLVersion.sslvTLSv1_2]; //depending on your server, change this at your code;
+        (self.IOHandler as TIdSSLIOHandlerSocketOpenSSL).SSLOptions.SSLVersions := [TIdSSLVersion.sslvTLSv1, TIdSSLVersion.sslvTLSv1_1, TIdSSLVersion.sslvTLSv1_2]; //depending on your server, change this at your code;
       end
       else
         raise Exception.Create('Please, inform a TIdSSLIOHandlerSocketOpenSSL descendant');
@@ -171,23 +215,29 @@ begin
 
 
     inherited Connect;
-
+    if not URI.Port.IsEmpty then
+      URI.Host := URI.Host+':'+URI.Port;
     self.Socket.WriteLn(format('GET %s HTTP/1.1', [URI.Path]));
     self.Socket.WriteLn(format('Host: %s', [URI.Host]));
     self.Socket.WriteLn('User-Agent: Delphi WebSocket Simple Client');
-//    self.Socket.WriteLn('Accept-Encoding: gzip, deflate');
-    self.Socket.WriteLn('Connection: Upgrade');
+    self.Socket.WriteLn('Connection: keep-alive, Upgrade');
     self.Socket.WriteLn('Upgrade: WebSocket');
     self.Socket.WriteLn('Sec-WebSocket-Version: 13');
-    self.Socket.WriteLn('Sec-WebSocket-Protocol: chat');
     self.Socket.WriteLn(format('Sec-WebSocket-Key: %s', [generateWebSocketKey()]));
     self.Socket.WriteLn('');
 
-    readFromSocket;
+    readFromWebSocket;
     startHeartBeat;
   finally
     URI.Free;
   end;
+end;
+
+procedure TIdSimpleWebSocketClient.sendCloseHandshake;
+begin
+  self.lClosingEventLocalHandshake := true;
+  self.Socket.Write(self.encodeFrame('', TOpCode.TOConnectionClose));
+  TThread.Sleep(200);
 end;
 
 constructor TIdSimpleWebSocketClient.Create(AOwner: TComponent);
@@ -207,7 +257,7 @@ begin
   inherited;
 end;
 
-function TIdSimpleWebSocketClient.encodeFrame(pMsg:String; pPong:Boolean): TIdBytes;
+function TIdSimpleWebSocketClient.encodeFrame(pMsg:String; pOpCode:TOpCode): TIdBytes;
 var FIN, MASK: Cardinal;
     MaskingKey:array[0..3] of cardinal;
     EXTENDED_PAYLOAD_LEN:array[0..3] of Cardinal;
@@ -217,14 +267,7 @@ var FIN, MASK: Cardinal;
     ExtendedPayloadLength:Integer;
 begin
   FIN:=0;
-  FIN := Set_a_bit(FIN,7);
-  if pPong then
-  begin
-    FIN := Set_a_bit(FIN,3);//Ping= 10001001
-    FIN := Set_a_bit(FIN,1);//Pong= 10001010
-  end
-  else
-    FIN := Set_a_bit(FIN,0);
+  FIN := Set_a_bit(FIN,7) or TOpCodeByte[pOpCode];
 
   MASK  := set_a_bit(0,7);
 
@@ -277,79 +320,85 @@ begin
   result := buffer;
 end;
 
-function TIdSimpleWebSocketClient.encodePong: TidBytes;
-begin
-  result := encodeFrame('', true);
-end;
-
 function TIdSimpleWebSocketClient.Get_a_Bit(const aValue: Cardinal;
   const Bit: Byte): Boolean;
 begin
   Result := (aValue and (1 shl Bit)) <> 0;
 end;
 
-function TIdSimpleWebSocketClient.readFromSocket:Boolean;
+procedure TIdSimpleWebSocketClient.readFromWebSocket;
 var
-  s: string;
+  lSpool: string;
   b:Byte;
   T: ITask;
-  posicao:Integer;
-  size,sizemsg:Integer;
-  pingByte:Byte;
-  masked:boolean;
-  upgraded:Boolean;
-  forceDisconnect:Boolean;
+  lPos:Integer;
+  lSize:Integer;
+  lOpCode:Byte;
+  linFrame:Boolean;
+  lMasked:boolean;
+  lForceDisconnect:Boolean;
   lHeader:TStringlist;
+//  lClosingRemoteHandshake:Boolean;
+//  lPing:Boolean;
 begin
-  s := '';
-  posicao  := 0;
-  size := 0;
-  masked := false;
-  upgraded  := false;
-  pingByte := Set_a_Bit(0,7); //1000100//PingByte
-  pingByte := Set_a_Bit(pingByte,3);
-  pingByte := Set_a_Bit(pingByte,0);
+  lSpool := '';
+  lPos  := 0;
+  lSize := 0;
+  lOpCode := 0;
+  lMasked    := false;
+  FUpgraded  := false;
+//  lPing     := false;
+//  pingByte  := Set_a_Bit(0,7); //1001001//PingByte
+//  pingByte  := Set_a_Bit(pingByte,3);
+//  pingByte  := Set_a_Bit(pingByte,0);
+//  closeByte := Set_a_Bit(0,7);//1001000//CloseByte
+//  closeByte := Set_a_Bit(closeByte,3);
+
   lHeader := TStringList.Create;
-  result := false;
+  linFrame := false;
+
   try
-    while Connected and not upgraded do //First, we guarantee that this is an valid Websocket
+    while Connected and not FUpgraded do //First, we guarantee that this is an valid Websocket
     begin
       b := self.Socket.ReadByte;
 
-      s := s+chr(b);
-      if (not upgraded and (b=ord(#13))) then
+      lSpool := lSpool+chr(b);
+      if (not FUpgraded and (b=ord(#13))) then
       begin
-        if s=#10#13 then
+        if lSpool=#10#13 then
         begin
 
           //verifies header
-          if not verifyHeader(lHeader) then
-          begin
+          try
+            if not verifyHeader(lHeader) then
+            begin
               raise Exception.Create('URL is not from an valid websocket server, not a valid response header found');
+            end;
+          finally
+            lHeader.Free;
           end;
 
-          upgraded := true;
-          s := '';
-          posicao := 0;
-          sizeMsg := 0;
+          FUpgraded := true;
+          lSpool := '';
+          lPos := 0;
         end
         else
         begin
           if assigned(onConnectionDataEvent) then
-            onConnectionDataEvent(self, s);
+            onConnectionDataEvent(self, lSpool);
 
-          lHeader.Add(s.Trim);
-          s := '';
+          lHeader.Add(lSpool.Trim);
+          lSpool := '';
         end;
       end;
     end;
   except
   on e:Exception do
   begin
-    forceDisconnect := true;
+    lForceDisconnect := true;
     if assigned(self.onError) then
-      self.onError(self, e, e.Message, forceDisconnect);
-    if forceDisconnect then
+      self.onError(self, e, e.Message, lForceDisconnect);
+    if lForceDisconnect then
       self.Close;
     exit;
   end;
@@ -368,59 +417,83 @@ begin
             b := self.Socket.ReadByte;
 
 
-            if upgraded and (posicao=0) and Get_a_Bit(b, 7) then //FIN
+            if FUpgraded and (lPos=0) and Get_a_Bit(b, 7) then //FIN
             begin
-              if b=pingByte then
-              begin
-                b := self.Socket.ReadByte;
-                self.Socket.WriteDirect(encodePong);
-                if assigned(onPing) then
-                  onPing(self);
+              linFrame  := true;
+              lOpCode := Clear_a_Bit(b, 7);
 
-              end
-              else
-                inc(posicao);
+              inc(lPos);
+
+
+              if lOpCode=TOpCodeByte[TOpCode.TOConnectionClose] then
             end
-            else if upgraded and (posicao=1) then
+            else if FUpgraded and (lPos=1) then
             begin
-              masked  := Get_a_Bit(b, 7);
-              size    := b;
-              if masked then
-                size    := b-set_a_bit(0,7);
-              sizeMsg := 0;
-              if size=0 then
-                posicao := 0
+              lMasked  := Get_a_Bit(b, 7);
+              lSize    := b;
+              if lMasked then
+                lSize    := b-set_a_bit(0,7);
+              if lSize=0 then
+                lPos := 0
               else
-              if size=126 then // get size from 2 next bytes
+              if lSize=126 then // get size from 2 next bytes
               begin
                 b := self.Socket.ReadByte;
-                size := Round(b*intpower(2,8));
+                lSize := Round(b*intpower(2,8));
                 b := self.Socket.ReadByte;
-                size := size+Round(b*intpower(2,0));
+                lSize := lSize+Round(b*intpower(2,0));
               end
-              else if size=127 then
-                raise Exception.Create('Size block bigger than supported by this framework, fix is welcome');
+              else if lSize=127 then
+                raise Exception.Create('TODO: Size block bigger than supported by this framework, fix is welcome');
 
-              inc(posicao);
+              inc(lPos);
             end
             else
+            if linFrame then
             begin
-              if upgraded then
-              begin
-                inc(sizeMsg);
-                if sizemsg=size then
-                  posicao:=0;
-              end;
+              lSpool := lSpool+chr(b);
 
-              s := s+chr(b);
-              if (upgraded and (sizemsg=size)) then
+              if (FUpgraded and (Length(lSpool)=lSize)) then
               begin
-                posicao := 0;
-                sizeMsg := 0;
-                if upgraded and assigned(onDataEvent) then
-                  onDataEvent(self, s);
+                lPos   := 0;
+                linFrame := false;
 
-                s := '';
+                if lOpCode=TOpCodeByte[TOpCode.TOPing] then
+                begin
+                  try
+                    lInternalLock.Enter;
+                    self.Socket.Write(encodeFrame(lSpool, TOpCode.TOPong));
+                  finally
+                    lInternalLock.Leave;
+                  end;
+
+                if assigned(onPing) then
+                  onPing(self, lSpool);
+                end
+                else
+                begin
+                  if FUpgraded and assigned(FonDataEvent) and (not (lOpCode=TOpCodeByte[TOpCode.TOConnectionClose]))  then
+                    onDataEvent(self, lSpool);
+                  if assigned(self.lSyncFunctionTrigger) then
+                  begin
+                    if self.lSyncFunctionTrigger(lSpool) then
+                    begin
+                      self.lSyncFunctionEvent.SetEvent;
+                    end;
+                  end;
+                end;
+
+                lSpool := '';
+                if lOpCode=TOpCodeByte[TOpCode.TOConnectionClose] then
+                begin
+                  if not Self.lClosingEventLocalHandshake then
+                  begin
+                    self.Close;
+                    if assigned(self.OnDisconnected) then
+                      self.OnDisconnected(self);
+                  end;
+                  break
+                end;
 
               end;
             end;
@@ -428,22 +501,29 @@ begin
         except
         on e:Exception do
         begin
-          forceDisconnect := true;
+          lForceDisconnect := true;
           if assigned(self.onError) then
-            self.onError(self, e, e.Message, forceDisconnect);
-          if forceDisconnect then
+            self.onError(self, e, e.Message, lForceDisconnect);
+          if lForceDisconnect then
             self.Close;
         end;
         end;
       end);
 
-  if not Connected or not upgraded then
-    raise Exception.Create('Websocket not connected or timeout');
+  if ((not Connected) or (not FUpgraded))and (not (( lOpCode=TOpCodeByte[TOpCode.TOConnectionClose]) or lClosingEventLocalHandshake))then
+  begin
+
+    raise Exception.Create('Websocket not connected or timeout'+QuotedStr(lSpool));
+  end
+  else
+     if assigned(self.OnUpgrade) then
+       self.OnUpgrade(self);
+
 end;
 
 procedure TIdSimpleWebSocketClient.startHeartBeat;
 var TimeUltimaNotif:TDateTime;
-    forceDisconnect:Boolean;
+    lForceDisconnect:Boolean;
 begin
   TThread.CreateAnonymousThread(procedure begin
     TimeUltimaNotif := Now;
@@ -462,10 +542,10 @@ begin
     except
     on e:Exception do
     begin
-      forceDisconnect := true;
+      lForceDisconnect := true;
       if assigned(self.onError) then
-        self.onError(self, e, e.Message, forceDisconnect);
-      if forceDisconnect then
+        self.onError(self, e, e.Message, lForceDisconnect);
+      if lForceDisconnect then
         self.Close;
     end;
     end;
@@ -477,9 +557,15 @@ function TIdSimpleWebSocketClient.verifyHeader(pHeader: TStrings): boolean;
 begin
   pHeader.NameValueSeparator := ':';
   result := false;
+  if (pos('HTTP/1.1 101', pHeader[0])=0) and (pos('HTTP/1.1', pHeader[0])>0) then
+    raise Exception.Create(pHeader[0].Substring(9));
+
   if (pHeader.Values['Connection'].Trim.ToLower='upgrade') and (pHeader.Values['Upgrade'].Trim.ToLower='websocket') then
   begin
-    if pHeader.Values['Sec-WebSocket-Accept'].Trim=self.ExpectedSec_WebSocket_Accept then
+    if pHeader.Values['Sec-WebSocket-Accept'].Trim=self.SecWebSocketAcceptExpectedResponse then
+      result := true
+    else
+    if pHeader.Values['Sec-WebSocket-Accept'].trim.IsEmpty then
       result := true
     else
       raise Exception.Create('Unexpected return key on Sec-WebSocket-Accept in handshake');
@@ -501,6 +587,24 @@ begin
   finally
     lInternalLock.Leave;
   end;
+end;
+
+procedure TIdSimpleWebSocketClient.writeTextSync(pMsg: String;
+  pTriggerFunction: TFunc<String,Boolean>);
+begin
+  self.lSyncFunctionTrigger :=  pTriggerFunction;
+  try
+    self.lSyncFunctionEvent := TSimpleEvent.Create();
+    self.lSyncFunctionEvent.ResetEvent;
+    self.writeText(pMsg);
+    self.lSyncFunctionEvent.WaitFor(self.ReadTimeout);
+
+  finally
+    self.lSyncFunctionTrigger:= nil;
+    self.lSyncFunctionEvent.Free;
+  end;
+
+
 end;
 
 end.
