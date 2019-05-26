@@ -332,7 +332,7 @@ var
   b:Byte;
   T: ITask;
   lPos:Integer;
-  lSize:int64;
+  lSize:Integer;
   lOpCode:Byte;
   linFrame:Boolean;
   lMasked:boolean;
@@ -408,8 +408,6 @@ begin
   if Connected then
     T := TTask.Run(
       procedure
-      var
-        extended_payload_length: cardinal;
       begin
 
         try
@@ -440,11 +438,13 @@ begin
               else
               if lSize=126 then // get size from 2 next bytes
               begin
-                lsize := self.socket.ReadUInt16;
+                b := self.Socket.ReadByte;
+                lSize := Round(b*intpower(2,8));
+                b := self.Socket.ReadByte;
+                lSize := lSize+Round(b*intpower(2,0));
               end
-              else if lSize=127 then begin
-                lsize := self.socket.ReadUInt64;
-              end;
+              else if lSize=127 then
+                raise Exception.Create('TODO: Size block bigger than supported by this framework, fix is welcome');
 
               inc(lPos);
             end

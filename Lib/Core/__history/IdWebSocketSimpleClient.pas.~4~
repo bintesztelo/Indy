@@ -217,7 +217,8 @@ begin
     inherited Connect;
     if not URI.Port.IsEmpty then
       URI.Host := URI.Host+':'+URI.Port;
-    self.Socket.WriteLn(format('GET %s HTTP/1.1', [uri.path+uri.Document]));
+    var s := uri.path+uri.Document;
+    self.Socket.WriteLn(format('GET %s HTTP/1.1', [s]));
     self.Socket.WriteLn(format('Host: %s', [URI.Host]));
     self.Socket.WriteLn('User-Agent: Delphi WebSocket Simple Client');
     self.Socket.WriteLn('Connection: keep-alive, Upgrade');
