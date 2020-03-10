@@ -4,8 +4,8 @@
  * Author: Lucas Rubian Schatz
  * Copyright 2018, Indy Working Group.
  *
+ * Date: 25/05/2019 - Jason R. Nelson (adaloveless) - Fix warning and incorrect URI in "GET" request
  * Date: 22/02/2018
-
  TODO: implement methods for sending and receiving binary data, and support for bigger than 65536 bytes support
 }
 {
@@ -26,7 +26,6 @@ begin
   lSWC.Connect('wss://echo.websocket.org');
   lSWC.writeText('!!It worked!!');
 end;
-
 }
 
 unit IdWebSocketSimpleClient;
@@ -176,6 +175,7 @@ procedure TIdSimpleWebSocketClient.Connect(pURL: String);
 var  URI      : TIdURI;
      lSecure  : Boolean;
 begin
+  uri := nil;
   try
     lClosingEventLocalHandshake := false;
     URI           := TIdURI.Create(pURL);
@@ -217,7 +217,7 @@ begin
     inherited Connect;
     if not URI.Port.IsEmpty then
       URI.Host := URI.Host+':'+URI.Port;
-    self.Socket.WriteLn(format('GET %s HTTP/1.1', [URI.Path]));
+    self.Socket.WriteLn(format('GET %s HTTP/1.1', [uri.path+uri.Document]));
     self.Socket.WriteLn(format('Host: %s', [URI.Host]));
     self.Socket.WriteLn('User-Agent: Delphi WebSocket Simple Client');
     self.Socket.WriteLn('Connection: keep-alive, Upgrade');
@@ -332,7 +332,7 @@ var
   b:Byte;
   T: ITask;
   lPos:Integer;
-  lSize:Integer;
+  lSize:int64;
   lOpCode:Byte;
   linFrame:Boolean;
   lMasked:boolean;
@@ -408,6 +408,8 @@ begin
   if Connected then
     T := TTask.Run(
       procedure
+      var
+        extended_payload_length: cardinal;
       begin
 
         try
@@ -438,13 +440,11 @@ begin
               else
               if lSize=126 then // get size from 2 next bytes
               begin
-                b := self.Socket.ReadByte;
-                lSize := Round(b*intpower(2,8));
-                b := self.Socket.ReadByte;
-                lSize := lSize+Round(b*intpower(2,0));
+                lsize := self.socket.ReadUInt16;
               end
-              else if lSize=127 then
-                raise Exception.Create('TODO: Size block bigger than supported by this framework, fix is welcome');
+              else if lSize=127 then begin
+                lsize := self.socket.ReadUInt64;
+              end;
 
               inc(lPos);
             end
