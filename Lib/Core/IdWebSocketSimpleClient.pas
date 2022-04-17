@@ -10,8 +10,15 @@
 }
 {
 Sample code:
+
+procedure Tform1.lSWC1DataEvent(Sender: TObject; const Text: string);
+begin
+  smemo1.Lines.Add(text);
+end;
+
 //var lSWC:TIdSimpleWebSocketClient;
 ...
+
 begin
   lSWC := TIdSimpleWebSocketClient.Create(self);
   lSWC.onDataEvent           := self.lSWC1DataEvent;  //TSWSCDataEvent
@@ -25,6 +32,9 @@ begin
   end;
   lSWC.Connect('wss://echo.websocket.org');
   lSWC.writeText('!!It worked!!');
+  //OR:
+  //lSWC.Connect('wss://stream.binance.com:9443/ws');
+  //lSWC.writeText('{"method": "SUBSCRIBE","params": ["btcusdt@kline_15m"],"id": 1}');
 end;
 }
 
